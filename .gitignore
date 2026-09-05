@@ -1,0 +1,12 @@
+.env
+credentials.json
+token.json
+venv/
+__pycache__/
+*.pyc
+data/*.csv
+data/needs_manual_email.csv
+data/pending_review.csv
+data/contacted_leads.csv
+data/india_leads.csv
+*.log
