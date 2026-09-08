@@ -16,6 +16,7 @@ import csv
 import math
 import os
 import random
+import re
 import time
 from datetime import datetime, timedelta
 
@@ -44,8 +45,8 @@ CONTACTED_FIELDNAMES = [
 
 INDIA_FIELDNAMES = [
     "place_id", "business_name", "category", "location", "suggested_need",
-    "phone", "whatsapp_link", "email", "social_links", "rating",
-    "review_count", "contacted", "date_found",
+    "phone", "whatsapp_link", "email", "email_subject", "email_body", 
+    "social_links", "rating", "review_count", "contacted", "date_found", "whatsapp_message"
 ]
 
 
@@ -93,6 +94,12 @@ def _load_all_known_place_ids():
             ids.add(pid)
 
     for row in _read_csv(INDIA_CSV):
+        pid = row.get("place_id", "")
+        if pid:
+            ids.add(pid)
+
+    intl_csv = getattr(config, "INTERNATIONAL_CONTACTS_CSV", "data/international_contacts.csv")
+    for row in _read_csv(intl_csv):
         pid = row.get("place_id", "")
         if pid:
             ids.add(pid)
@@ -210,25 +217,63 @@ def _process_india_leads(india_leads, today_str):
     """Save India leads directly to india_leads.csv. No Hunter/Snov/Groq/Gmail."""
     saved = 0
     for lead in india_leads:
+        suggested_need = lead_finder._suggest_need(lead)
+        whatsapp_msg = message_writer.write_whatsapp_message(lead)
+        
         record = {
             "place_id": lead["place_id"],
             "business_name": lead["name"],
             "category": lead["category"],
             "location": lead.get("location", ""),
-            "suggested_need": lead_finder._suggest_need(lead),
+            "suggested_need": suggested_need,
             "phone": lead.get("phone", ""),
             "whatsapp_link": lead_finder._phone_to_whatsapp_link(lead.get("phone", "")),
             "email": "",
+            "email_subject": "",
+            "email_body": "",
             "social_links": lead.get("social_links", ""),
             "rating": lead.get("rating", ""),
             "review_count": lead.get("review_count", ""),
             "contacted": "False",
             "date_found": today_str,
+            "whatsapp_message": whatsapp_msg
         }
         _append_csv(INDIA_CSV, record, fieldnames=INDIA_FIELDNAMES)
         saved += 1
-        print(f"  [🇮🇳] {lead['name']} ({lead['category']}, {lead['location']}) -> india_leads.csv")
+        print(f"  [IND] {lead['name']} ({lead['category']}, {lead['location']}) -> india_leads.csv")
     return saved
+
+
+# ---------------------------------------------------------------------------
+# International manual fallback helpers
+# ---------------------------------------------------------------------------
+
+def _infer_whatsapp_link(phone, location):
+    if not phone:
+        return ""
+    digits = re.sub(r"[^\d]", "", phone)
+    loc_lower = location.lower()
+    
+    # Try to infer country from location string
+    if "usa" in loc_lower or "united states" in loc_lower or "canada" in loc_lower:
+        cc = "1"
+    elif "uk" in loc_lower or "united kingdom" in loc_lower:
+        cc = "44"
+    elif "uae" in loc_lower or "united arab emirates" in loc_lower or "dubai" in loc_lower or "abu dhabi" in loc_lower:
+        cc = "971"
+    elif "australia" in loc_lower:
+        cc = "61"
+    elif "india" in loc_lower:
+        cc = "91"
+        if digits.startswith("0"):
+            digits = digits[1:]
+    else:
+        # Default no formatting if country can't be inferred
+        return phone
+        
+    if digits.startswith(cc) and len(digits) > len(cc) + 5:
+        return f"https://wa.me/{digits}"
+    return f"https://wa.me/{cc}{digits}"
 
 
 # ---------------------------------------------------------------------------
@@ -257,18 +302,12 @@ def run():
     remaining_cap = current_cap - drafts_today
 
     # Step 2: Compute India vs international targets
-    total_target = config.DAILY_LEAD_TARGET
-    india_target = max(1, math.ceil(total_target * config.INDIA_LEAD_PERCENTAGE / 100))
-    intl_target = total_target - india_target
+    total_target = getattr(config, "DAILY_LEAD_TARGET", 20)
+    india_target = getattr(config, "MAX_INDIA_LEADS_PER_DAY", max(1, math.ceil(total_target * getattr(config, "INDIA_LEAD_PERCENTAGE", 20) / 100)))
+    intl_target = getattr(config, "MAX_INTERNATIONAL_LEADS_PER_DAY", total_target - india_target)
 
-    # Cap international target to remaining email draft cap
-    if remaining_cap <= 0:
-        print(f"[cap] Daily email cap reached ({current_cap} drafts already exist for {today_str}). Skipping international leads.")
-        intl_target = 0
-    else:
-        intl_target = min(intl_target, remaining_cap)
-
-    print(f"[{started_at}] Targeting {india_target} India + {intl_target} international leads (cap: {current_cap}, drafts today: {drafts_today}).")
+    # We want to collect leads regardless of email cap, so don't cap intl_target here.
+    print(f"[{started_at}] Targeting {india_target} India + {intl_target} international leads (email cap: {current_cap}, drafts today: {drafts_today}, remaining email slots: {remaining_cap}).")
 
 
     # Step 3a: Find and save India leads
@@ -291,80 +330,113 @@ def run():
 
     # Step 4: Process international leads through Hunter/Snov -> Groq -> pending_review.csv
     sent_log = []
-    skipped_no_email = []
+    international_log = []
+    processed_count = 0
+    
+    # Track how many emails we actually draft this run
+    emails_drafted_this_run = 0
 
     for lead in leads:
-        if len(sent_log) >= intl_target:
+        if processed_count >= intl_target:
             break
 
         contact = email_finder.find_contact_info(lead)
         email_address = contact["email"]
-        if not email_address:
-            lead_with_social = dict(lead)
-            lead_with_social["social_links"] = " | ".join(contact["social_links"]) or "none found"
-            skipped_no_email.append(lead_with_social)
-            _append_csv(
-                config.NEEDS_EMAIL_CSV, lead_with_social,
-                fieldnames=list(lead_with_social.keys()),
-            )
-            continue
 
-        try:
-            message = message_writer.write_email(lead)
-        except Exception as e:
-            print(f"  [!] message generation failed for {lead['name']}: {e}")
-            continue
-        if not message:
-            print(f"  [!] no message generated for {lead['name']}, skipping.")
-            continue
+        # 1. ALWAYS generate the friendly WhatsApp message
+        whatsapp_msg = message_writer.write_whatsapp_message(lead)
 
-        record = {
-            "id": lead["place_id"],
+        # 2. ONLY generate an email if we have an email address AND haven't hit the daily email cap
+        message = None
+        if email_address and emails_drafted_this_run < remaining_cap:
+            try:
+                message = message_writer.write_email(lead)
+                if message:
+                    emails_drafted_this_run += 1
+            except Exception as e:
+                print(f"  [!] email generation failed for {lead['name']}: {e}")
+
+        # TASK 1 & 2: Write ALL to international_contacts.csv
+        record_intl = {
+            "place_id": lead["place_id"],
             "business_name": lead["name"],
-            "email": email_address,
-            "industry_or_category": lead["category"],
+            "category": lead["category"],
             "location": lead.get("location", ""),
-            "offer_type": message.get("offer_type", ""),
-            "subject": message["subject"],
-            "email_body": message["body"],
-            "whatsapp_version": message.get("whatsapp_version", ""),
-            "followup": message.get("followup", ""),
-            "reviewed": "False",
-            "status": "draft",
-            "created_date": today_str,
-            "is_followup": "False",
+            "suggested_need": lead_finder._suggest_need(lead),
+            "phone": lead.get("phone", ""),
+            "whatsapp_link": _infer_whatsapp_link(lead.get("phone", ""), lead.get("location", "")),
+            "email": email_address or "",
+            "email_subject": message.get("subject", "") if message else "",
+            "email_body": message.get("body", "") if message else "",
+            "social_links": " | ".join(contact.get("social_links", [])) or "none found",
+            "rating": lead.get("rating", ""),
+            "review_count": lead.get("review_count", ""),
+            "contacted": "False",
+            "date_found": today_str,
+            "whatsapp_message": whatsapp_msg
         }
+        
+        international_log.append(record_intl)
+        _append_csv(
+            getattr(config, "INTERNATIONAL_CONTACTS_CSV", "data/international_contacts.csv"), 
+            record_intl,
+            fieldnames=list(record_intl.keys()),
+        )
+        processed_count += 1
 
-        _append_csv(PENDING_CSV, record, fieldnames=PENDING_FIELDNAMES)
-        sent_log.append(record)
-        print(f"  [x] drafted for {lead['name']} <{email_address}> -> pending review")
+        if message:
+            # TASK 3: Still write to pending_review.csv if email exists and was generated
+            record = {
+                "id": lead["place_id"],
+                "business_name": lead["name"],
+                "email": email_address,
+                "industry_or_category": lead["category"],
+                "location": lead.get("location", ""),
+                "offer_type": message.get("offer_type", ""),
+                "subject": message["subject"],
+                "email_body": message["body"],
+                "whatsapp_version": message.get("whatsapp_version", ""),
+                "followup": message.get("followup", ""),
+                "reviewed": "False",
+                "status": "draft",
+                "created_date": today_str,
+                "is_followup": "False",
+            }
+
+            _append_csv(PENDING_CSV, record, fieldnames=PENDING_FIELDNAMES)
+            sent_log.append(record)
+            print(f"  [x] drafted for {lead['name']} <{email_address}> -> pending review")
+        else:
+            print(f"  [x] processed {lead['name']} -> international_contacts (no email or email cap reached)")
 
         time.sleep(random.uniform(*config.SEND_DELAY_SECONDS))
 
-    _send_report(sent_log, skipped_no_email, followups_queued, india_saved, started_at)
+    _send_report(sent_log, international_log, followups_queued, india_saved, started_at)
     print(f"Done. Drafted {len(sent_log)} intl emails, {india_saved} India leads saved, "
-          f"{followups_queued} follow-ups queued, {len(skipped_no_email)} leads need manual email lookup.")
+          f"{followups_queued} follow-ups queued, {len(international_log)} international leads saved.")
+    print(f"Total Places API requests made: {lead_finder.TOTAL_API_CALLS}")
 
 
-def _send_report(sent_log, skipped_no_email, followups_queued, india_saved, started_at):
+def _send_report(sent_log, international_log, followups_queued, india_saved, started_at):
     lines = [
         f"Cold outreach report - {started_at.strftime('%Y-%m-%d')}",
-        f"International drafts created: {len(sent_log)}",
+        f"International email drafts created: {len(sent_log)}",
+        f"International contacts saved: {len(international_log)}",
         f"India leads saved (manual outreach): {india_saved}",
         f"Follow-ups queued: {followups_queued}",
-        f"Leads found but skipped (no email discovered): {len(skipped_no_email)}",
         "",
-        "--- Drafted today (international) ---",
+        "--- Drafted today (international with email) ---",
     ]
     for r in sent_log:
         lines.append(f"- {r['business_name']} ({r['industry_or_category']}, {r['location']}) -> {r['email']} | \"{r['subject']}\"")
 
-    if skipped_no_email:
+    no_email_count = sum(1 for l in international_log if not l.get("email"))
+    if no_email_count > 0:
         lines.append("")
-        lines.append("--- Needs manual contact (saved to needs_manual_email.csv) ---")
-        for lead in skipped_no_email[:15]:
+        lines.append(f"--- {no_email_count} international leads found with no email (saved to international_contacts.csv) ---")
+        for lead in [l for l in international_log if not l.get("email")][:15]:
             social = lead.get("social_links", "none found")
-            lines.append(f"- {lead['name']} | {lead.get('phone', 'no phone')} | {lead.get('address', '')} | social: {social}")
+            lines.append(f"- {lead['business_name']} | {lead.get('phone', 'no phone')} | {lead.get('location', '')} | social: {social}")
 
     body = "\n".join(lines)
     try:

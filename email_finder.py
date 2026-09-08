@@ -16,6 +16,7 @@ import re
 import time
 import requests
 import dns.resolver
+import urllib.parse
 
 import config
 
@@ -93,6 +94,89 @@ def _duckduckgo_search(query, max_results=4):
         return []
 
 
+def _search_hunter(domain):
+    if not config.HUNTER_API_KEY:
+        return None
+    try:
+        resp = requests.get(
+            "https://api.hunter.io/v2/domain-search",
+            params={"domain": domain, "api_key": config.HUNTER_API_KEY},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            emails = data.get("data", {}).get("emails", [])
+            if emails:
+                return emails[0].get("value")
+            else:
+                print(f"  [Hunter] No email found for this domain: {domain}")
+                return None
+        elif resp.status_code in (401, 429):
+            print(f"  [Hunter] Quota exceeded or auth error (HTTP {resp.status_code}): {resp.text}")
+            return None
+        else:
+            print(f"  [Hunter] API error for {domain}: {resp.status_code} - {resp.text}")
+            return None
+    except Exception as e:
+        print(f"  [Hunter] Exception for {domain}: {e}")
+        return None
+
+
+def _get_snov_token():
+    if not config.SNOV_CLIENT_ID or not config.SNOV_CLIENT_SECRET:
+        return None
+    try:
+        resp = requests.post(
+            "https://api.snov.io/v1/oauth/access_token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": config.SNOV_CLIENT_ID,
+                "client_secret": config.SNOV_CLIENT_SECRET
+            },
+            timeout=10
+        )
+        if resp.status_code == 200:
+            return resp.json().get("access_token")
+        elif resp.status_code == 401 or "invalid_client" in resp.text:
+            print(f"  [Snov] Quota exceeded or auth error getting token (HTTP {resp.status_code}): {resp.text}")
+            return None
+        else:
+            print(f"  [Snov] Error getting token: {resp.status_code} - {resp.text}")
+            return None
+    except Exception as e:
+        print(f"  [Snov] Exception getting token: {e}")
+        return None
+
+
+def _search_snov(domain, token):
+    if not token:
+        return None
+    try:
+        resp = requests.post(
+            "https://api.snov.io/v2/domain-emails-with-info",
+            data={"domain": domain},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            emails = data.get("emails", [])
+            if emails:
+                return emails[0].get("email")
+            else:
+                print(f"  [Snov] No email found for this domain: {domain}")
+                return None
+        elif resp.status_code in (401, 402, 429):
+            print(f"  [Snov] Quota exceeded (HTTP {resp.status_code}): {resp.text}")
+            return None
+        else:
+            print(f"  [Snov] API error for {domain}: {resp.status_code} - {resp.text}")
+            return None
+    except Exception as e:
+        print(f"  [Snov] Exception for {domain}: {e}")
+        return None
+
+
 def find_contact_info(lead):
     """
     Returns {"email": str|None, "social_links": [str, ...]}.
@@ -102,6 +186,28 @@ def find_contact_info(lead):
     name = lead.get("name", "")
     location = lead.get("location", "")
     social_links = []
+
+    # 0. Try Hunter/Snov if we have a website domain
+    domain = None
+    website = lead.get("website", "")
+    if website:
+        try:
+            parsed = urllib.parse.urlparse(website if "://" in website else "http://" + website)
+            domain = parsed.netloc.split(":")[0]
+            if domain.startswith("www."):
+                domain = domain[4:]
+        except Exception:
+            pass
+
+    if domain:
+        email = _search_hunter(domain)
+        if email:
+            return {"email": email, "social_links": social_links}
+            
+        token = _get_snov_token()
+        email = _search_snov(domain, token)
+        if email:
+            return {"email": email, "social_links": social_links}
 
     # 1. Targeted Instagram search
     ig_urls = _duckduckgo_search(f'"{name}" {location} site:instagram.com', max_results=2)

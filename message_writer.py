@@ -36,8 +36,8 @@ Body rules - MUST include all of these (this is the fix - previous drafts were t
 """
 
 OFFER_INSTRUCTIONS = {
-    "website": "One clear, concrete idea of what you'd actually do for them and why it'd help THIS specific business (a website build, a booking page, a menu people can find on Google, and optionally a WhatsApp auto-reply so they stop missing DMs after hours).",
-    "ads": "One clear, concrete idea of what you'd actually do for them and why it'd help THIS specific business (Instagram/Meta ads to drive traffic to their existing website, getting more local visibility)."
+    "website": "Offer to build them a clean, simple website or landing page with a booking system, plus a WhatsApp AI auto-reply agent so they never miss a customer inquiry after hours.",
+    "automation": "Since they already have a website, offer to build them a WhatsApp AI Auto-Reply Agent that instantly answers customer questions and books appointments automatically 24/7."
 }
 
 # Same list as lead_finder.py — kept in sync so offer logic is consistent
@@ -62,7 +62,7 @@ def _is_social_url(url):
 def _decide_offer(lead):
     website = lead.get("website", "")
     if website and not _is_social_url(website):
-        return "ads"
+        return "automation"
     return "website"
 
 
@@ -123,7 +123,7 @@ def write_email(lead, is_followup=False):
         GROQ_URL,
         headers={"Authorization": f"Bearer {config.GROQ_API_KEY}", "Content-Type": "application/json"},
         json={
-            "model": "llama-3.3-70b-versatile",
+            "model": "groq/compound",
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": _build_user_prompt(lead)},
@@ -143,3 +143,58 @@ def write_email(lead, is_followup=False):
     except json.JSONDecodeError:
         pass
     return None
+
+
+WHATSAPP_PROMPT = """You write cold outreach WhatsApp messages for {your_name}, an {your_role}.
+
+Voice: Very friendly, casual, and human. Speak like you're texting a friend, not sending a corporate pitch. Use emojis naturally but sparingly. Short and punchy.
+
+Rules:
+1. Write ONE short WhatsApp opener (under 50 words).
+2. Look at their business details. If they have a website, offer to build them a WhatsApp AI Auto-Reply Agent so they never miss a customer inquiry. If they don't have a website (or just a social link), offer to build a simple Website/Landing Page + Booking System.
+3. Personalize it! Mention their specific business name or a genuine detail (like their rating or review count) so it's clearly not a generic blast.
+4. End with a soft, casual question (e.g. "Would you be open to a quick chat about this?", "Does that sound useful?").
+5. Sign off casually as {your_name_first}.
+6. Output STRICT JSON only: {{"whatsapp_message": "..."}}
+"""
+
+def write_whatsapp_message(lead):
+    """Returns a highly personalized, friendly whatsapp message string or empty string if generation failed."""
+    if not config.GROQ_API_KEY:
+        return ""
+    
+    system_prompt = WHATSAPP_PROMPT.format(
+        your_name=config.YOUR_NAME,
+        your_role=config.YOUR_ROLE,
+        your_name_first=config.YOUR_NAME.split()[0] if config.YOUR_NAME else "Me",
+    )
+    
+    user_prompt = f"""Business: {lead.get('name', '') or lead.get('business_name', '')}
+Category: {lead.get('category', '')}
+Location: {lead.get('location', '') or lead.get('address', '')}
+Google rating: {lead.get('rating', 'N/A')} ({lead.get('review_count', 'N/A')} reviews)
+Website: {lead.get('website', 'None')}
+"""
+
+    try:
+        resp = requests.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {config.GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "groq/compound",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.85,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+        return parsed.get("whatsapp_message", "")
+    except Exception as e:
+        print(f"  [!] WhatsApp generation failed: {e}")
+        return ""

@@ -79,6 +79,14 @@ def _load_contacted_place_ids():
                 if pid:
                     ids.add(pid)
 
+    intl_path = getattr(config, "INTERNATIONAL_CONTACTS_CSV", "data/international_contacts.csv")
+    if os.path.exists(intl_path):
+        with open(intl_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                pid = row.get("place_id", "")
+                if pid:
+                    ids.add(pid)
+
     return ids
 
 
@@ -86,7 +94,11 @@ def _load_contacted_place_ids():
 # Places API
 # ---------------------------------------------------------------------------
 
+TOTAL_API_CALLS = 0
+
 def _search_places(query):
+    global TOTAL_API_CALLS
+    TOTAL_API_CALLS += 1
     resp = requests.post(
         SEARCH_URL,
         headers={
@@ -101,6 +113,45 @@ def _search_places(query):
         print(f"  [!] Places API error for '{query}': {resp.status_code} - {resp.text[:300]}")
         return []
     return resp.json().get("places", [])
+
+# ---------------------------------------------------------------------------
+# Search Caching
+# ---------------------------------------------------------------------------
+import json
+from datetime import datetime
+
+def _get_cache_path():
+    return "data/search_cache.json"
+
+def _load_search_cache():
+    path = _get_cache_path()
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r") as f:
+        try:
+            return json.load(f)
+        except:
+            return {}
+
+def _save_search_cache(cache):
+    path = _get_cache_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
+    with open(path, "w") as f:
+        json.dump(cache, f)
+
+def _is_searched_today(query):
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    cache = _load_search_cache()
+    return query in cache.get(today_str, [])
+
+def _mark_searched_today(query):
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    cache = _load_search_cache()
+    if today_str not in cache:
+        cache[today_str] = []
+    if query not in cache[today_str]:
+        cache[today_str].append(query)
+    _save_search_cache(cache)
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +271,12 @@ def find_leads(target_count=30, max_searches=40):
         if len(leads) >= target_count or searches_done >= max_searches:
             break
         query = f"{category} in {location}"
+        
+        if _is_searched_today(query):
+            continue
+            
         results = _search_places(query)
+        _mark_searched_today(query)
         searches_done += 1
 
         for r in results:
@@ -258,7 +314,12 @@ def find_india_leads(target_count=4, max_searches=20):
         if len(leads) >= target_count or searches_done >= max_searches:
             break
         query = f"{category} in {location}"
+        
+        if _is_searched_today(query):
+            continue
+            
         results = _search_places(query)
+        _mark_searched_today(query)
         searches_done += 1
 
         for r in results:

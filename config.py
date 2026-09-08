@@ -30,8 +30,10 @@ YOUR_CALENDLY_LINK = "https://calendly.com/hello-aboobackerrikkas/30min"
 # ---------- Daily volume ----------
 DAILY_MIN_EMAILS = 15
 DAILY_MAX_EMAILS = 30
-DAILY_LEAD_TARGET = 20        # total leads found per run (India + international combined)
-INDIA_LEAD_PERCENTAGE = 20    # % of DAILY_LEAD_TARGET allocated to Indian leads
+DAILY_LEAD_TARGET = 20        # legacy, kept for backward compatibility if needed
+INDIA_LEAD_PERCENTAGE = 20    # legacy
+MAX_INTERNATIONAL_LEADS_PER_DAY = 16
+MAX_INDIA_LEADS_PER_DAY = 4
 SEND_DELAY_SECONDS = (45, 180)   # random delay range between sends - avoids spam pattern detection
 
 # ---------- Warmup Schedule ----------
@@ -119,7 +121,7 @@ BOOKING_PAGE_CATEGORIES = [
 
 # ---------- Files ----------
 LEADS_LOG_CSV = "data/contacted_leads.csv"     # dedupe log - never email the same business twice
-NEEDS_EMAIL_CSV = "data/needs_manual_email.csv"  # leads found but no email discovered - for manual follow-up
+INTERNATIONAL_CONTACTS_CSV = "data/international_contacts.csv"  # All international leads found
 PENDING_REVIEW_CSV = "data/pending_review.csv"   # drafts awaiting manual review before sending
 INDIA_LEADS_CSV = "data/india_leads.csv"         # India leads - manual WhatsApp/call outreach
 DAILY_LOG_DIR = "logs"
